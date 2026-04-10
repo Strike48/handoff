@@ -311,7 +311,7 @@ defmodule Handoff.DistributedExecutor do
     # regression risk. When multiple independent functions are ready, dispatch them
     # in parallel so a slow task on one branch doesn't block other branches.
     {new_pending, new_to_be_executed, new_executed} =
-      if length(ready_functions) <= 1 do
+      if not match?([_, _ | _], ready_functions) do
         Enum.reduce(
           ready_functions,
           {pending, to_be_executed, executed},
@@ -488,7 +488,10 @@ defmodule Handoff.DistributedExecutor do
         timeout: :infinity,
         ordered: false
       )
-      |> Enum.map(fn {:ok, result} -> result end)
+      |> Enum.map(fn
+        {:ok, result} -> result
+        {:exit, reason} -> {:unknown, {:error, "Task exited: #{inspect(reason)}"}}
+      end)
 
     Enum.reduce(
       results,
@@ -513,6 +516,9 @@ defmodule Handoff.DistributedExecutor do
       {function_id, result}
     end
   rescue
+    e in [AllocationError] ->
+      {function_id, {:allocation_error, e}}
+
     e ->
       Logger.error(
         "Concurrent dispatch failed for #{inspect(function_id)}: #{Exception.message(e)}"
@@ -546,9 +552,21 @@ defmodule Handoff.DistributedExecutor do
     {MapSet.put(p, function_id), MapSet.delete(tbe, function_id), ex}
   end
 
+  defp accumulate_dispatch_result(_dag, {_function_id, {:allocation_error, e}}, _acc) do
+    raise e
+  end
+
   defp accumulate_dispatch_result(_dag, {function_id, {:error, reason}}, {p, tbe, ex}) do
     Logger.error("Failed to execute function #{inspect(function_id)}: #{inspect(reason)}")
     {p, MapSet.delete(tbe, function_id), Map.put(ex, function_id, {:error, reason})}
+  end
+
+  defp accumulate_dispatch_result(_dag, {function_id, unexpected}, {p, tbe, ex}) do
+    Logger.error(
+      "Unexpected dispatch result for #{inspect(function_id)}: #{inspect(unexpected)}"
+    )
+
+    {p, MapSet.delete(tbe, function_id), Map.put(ex, function_id, {:error, unexpected})}
   end
 
   defp execute_function_on_node(
