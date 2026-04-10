@@ -306,13 +306,27 @@ defmodule Handoff.DistributedExecutor do
         all_deps_satisfied?(function, dag, executed)
       end)
 
-    # Execute ready functions
+    # Execute ready functions — concurrently when multiple are ready (STUD-542).
+    # When a single function is ready, use the original sequential path to minimize
+    # regression risk. When multiple independent functions are ready, dispatch them
+    # in parallel so a slow task on one branch doesn't block other branches.
     {new_pending, new_to_be_executed, new_executed} =
-      Enum.reduce(
-        ready_functions,
-        {pending, to_be_executed, executed},
-        &execute_ready_function(dag, max_retries, &1, &2)
-      )
+      if length(ready_functions) <= 1 do
+        Enum.reduce(
+          ready_functions,
+          {pending, to_be_executed, executed},
+          &execute_ready_function(dag, max_retries, &1, &2)
+        )
+      else
+        dispatch_ready_functions_concurrently(
+          dag,
+          ready_functions,
+          pending,
+          to_be_executed,
+          executed,
+          max_retries
+        )
+      end
 
     # Check for completed functions if there are any pending
     if MapSet.size(new_pending) > 0 do
@@ -445,6 +459,96 @@ defmodule Handoff.DistributedExecutor do
           {pending_acc, to_be_executed_acc, executed_acc}
       end
     end
+  end
+
+  # Dispatch multiple ready functions concurrently (STUD-542).
+  #
+  # All ready functions have their dependencies satisfied in `executed`, so they
+  # are truly independent — none depends on any other ready function. This makes
+  # concurrent dispatch safe: each function reads from the same immutable `executed`
+  # map and produces an independent result.
+  #
+  # After all functions complete, results are merged into the accumulators
+  # sequentially (ResultStore.store and DataLocationRegistry are GenServer calls,
+  # already concurrent-safe).
+  defp dispatch_ready_functions_concurrently(
+         dag,
+         ready_functions,
+         pending,
+         to_be_executed,
+         executed,
+         max_retries
+       ) do
+    results =
+      ready_functions
+      |> Task.async_stream(
+        fn function_id ->
+          dispatch_single_function(dag, function_id, executed, max_retries)
+        end,
+        timeout: :infinity,
+        ordered: false
+      )
+      |> Enum.map(fn {:ok, result} -> result end)
+
+    Enum.reduce(
+      results,
+      {pending, to_be_executed, executed},
+      &accumulate_dispatch_result(dag, &1, &2)
+    )
+  end
+
+  # Execute a single function and return {function_id, result} for accumulation.
+  defp dispatch_single_function(dag, function_id, executed, max_retries) do
+    function = Map.get(dag.functions, function_id)
+
+    if function.type == :inline do
+      {function_id, :inline}
+    else
+      args_for_execution =
+        fetch_arguments(dag.id, function.args, executed, function.node, dag.functions)
+
+      result =
+        execute_function_on_node(dag.id, function, args_for_execution, max_retries, dag.functions)
+
+      {function_id, result}
+    end
+  rescue
+    e ->
+      Logger.error(
+        "Concurrent dispatch failed for #{inspect(function_id)}: #{Exception.message(e)}"
+      )
+
+      {function_id, {:error, "Concurrent dispatch failed: #{Exception.message(e)}"}}
+  end
+
+  # Accumulate a single dispatch result into the {pending, to_be_executed, executed} tuple.
+  defp accumulate_dispatch_result(_dag, {function_id, :inline}, {p, tbe, ex}) do
+    {p, MapSet.delete(tbe, function_id), ex}
+  end
+
+  defp accumulate_dispatch_result(
+         _dag,
+         {function_id, {:ok, {:remote_store_and_registry_ok, _fun_id, _node}}},
+         {p, tbe, ex}
+       ) do
+    {p, MapSet.delete(tbe, function_id),
+     Map.put(ex, function_id, :remote_executed_and_registered)}
+  end
+
+  defp accumulate_dispatch_result(dag, {function_id, {:ok, result}}, {p, tbe, ex}) do
+    function = Map.get(dag.functions, function_id)
+    :ok = ResultStore.store(dag.id, function_id, result)
+    DataLocationRegistry.register(dag.id, function_id, function.node)
+    {p, MapSet.delete(tbe, function_id), Map.put(ex, function_id, result)}
+  end
+
+  defp accumulate_dispatch_result(_dag, {function_id, {:async, _pid}}, {p, tbe, ex}) do
+    {MapSet.put(p, function_id), MapSet.delete(tbe, function_id), ex}
+  end
+
+  defp accumulate_dispatch_result(_dag, {function_id, {:error, reason}}, {p, tbe, ex}) do
+    Logger.error("Failed to execute function #{inspect(function_id)}: #{inspect(reason)}")
+    {p, MapSet.delete(tbe, function_id), Map.put(ex, function_id, {:error, reason})}
   end
 
   defp execute_function_on_node(
