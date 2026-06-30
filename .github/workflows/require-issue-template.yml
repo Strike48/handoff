@@ -1,0 +1,58 @@
+name: Require Issue Template
+
+on:
+  issues:
+    types: [opened]
+
+jobs:
+  check-template:
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Enforce issue template
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const body = context.payload.issue.body;
+            const issueNumber = context.payload.issue.number;
+            const { owner, repo } = context.repo;
+
+            // Issues created from the project board quick-add have no body
+            if (body && body.trim().length >= 20) return;
+
+            // Create label if it doesn't exist
+            try {
+              await github.rest.issues.createLabel({
+                owner, repo,
+                name: 'needs-template',
+                color: 'e4e669',
+                description: 'Issue was not created using a template',
+              });
+            } catch (e) {
+              // Label already exists — ignore
+            }
+
+            await github.rest.issues.addLabels({
+              owner, repo,
+              issue_number: issueNumber,
+              labels: ['needs-template'],
+            });
+
+            await github.rest.issues.createComment({
+              owner, repo,
+              issue_number: issueNumber,
+              body: [
+                '> [!NOTE]',
+                '> This issue appears to have been created without a template (e.g., via the project board quick-add).',
+                '',
+                'Please [edit this issue](https://github.com/' + owner + '/' + repo + '/issues/' + issueNumber + ') to fill in the required context, or close it and [open a new one using a template](https://github.com/' + owner + '/' + repo + '/issues/new/choose).',
+                '',
+                '**Available templates:**',
+                '- 🐛 Bug Report',
+                '- ✨ Feature Request',
+                '- ⚡ Infrastructure Change',
+                '- 🔍 Spike / Research',
+                '- 🔒 Compliance Obligation',
+              ].join('\n'),
+            });
