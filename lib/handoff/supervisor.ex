@@ -20,6 +20,10 @@ defmodule Handoff.Supervisor do
         Application.get_env(:handoff, :resource_tracker, Handoff.SimpleResourceTracker)
 
     children = [
+      # Runs DAG execution tasks unlinked from DistributedExecutor so a crash
+      # in one DAG cannot take down the executor (and with it every other
+      # in-flight DAG on the node).
+      {Task.Supervisor, name: Handoff.DagTaskSupervisor},
       {Handoff.ResultStore, []},
       resource_tracker,
       {Handoff.DataLocationRegistry, []},

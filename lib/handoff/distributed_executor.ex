@@ -144,9 +144,17 @@ defmodule Handoff.DistributedExecutor do
         state
       end
 
-    # Begin execution process
+    # Begin execution process.
+    #
+    # async_nolink is load-bearing: this GenServer is a singleton that owns
+    # every in-flight DAG on the node. A linked task (Task.async) that dies
+    # from an exit signal — e.g. a killed HTTP pool process or a timed-out
+    # GenServer.call inside user code that `rescue` cannot catch — would take
+    # this executor down with it and cascade the kill to every other running
+    # DAG. Crashes are observed via the task monitor in handle_info instead,
+    # where the caller is replied to so it is never stuck in GenServer.call/3.
     task =
-      Task.async(fn ->
+      Task.Supervisor.async_nolink(Handoff.DagTaskSupervisor, fn ->
         try do
           execute_dag(dag, from, state.max_retries)
         rescue
@@ -169,6 +177,27 @@ defmodule Handoff.DistributedExecutor do
   @impl true
   def handle_info({ref, _result}, %{executing: executing} = state)
       when is_map_key(executing, ref) do
+    # DAG task finished; execute_dag already replied to the caller.
+    Process.demonitor(ref, [:flush])
+    {:noreply, %{state | executing: Map.delete(executing, ref)}}
+  end
+
+  # The DAG execution task died without producing a result — an exit signal
+  # (kill, linked-process death, in-stack exit) that the in-task rescue could
+  # not catch. Reply to the caller so it is not stuck in GenServer.call/3
+  # forever, and carry on: other in-flight DAGs are unaffected.
+  #
+  # This clause must come before the `monitored`-keyed :DOWN clause below,
+  # which matches any :process :DOWN message and would otherwise swallow
+  # these (the pre-existing ref-keyed clause was unreachable because of it).
+  @impl true
+  def handle_info({:DOWN, ref, :process, _pid, reason}, %{executing: executing} = state)
+      when is_map_key(executing, ref) do
+    if reason != :normal do
+      Logger.error("DAG execution task crashed: #{inspect(reason)}")
+      GenServer.reply(executing[ref], {:error, {:execution_crashed, reason}})
+    end
+
     {:noreply, %{state | executing: Map.delete(executing, ref)}}
   end
 
@@ -195,20 +224,6 @@ defmodule Handoff.DistributedExecutor do
         {:noreply,
          %{state | monitored: monitored, executing: executing, retry_count: retry_count}}
     end
-  end
-
-  @impl true
-  def handle_info({:DOWN, ref, _, _, reason}, %{executing: executing} = state)
-      when is_map_key(executing, ref) do
-    if reason != :normal do
-      # A monitored function execution crashed
-      Logger.warning("Function execution crashed: #{inspect(reason)}")
-
-      # Retry mechanism would go here
-      GenServer.reply(executing[ref], {:error, reason})
-    end
-
-    {:noreply, %{state | executing: Map.delete(executing, ref)}}
   end
 
   @impl true
@@ -311,13 +326,7 @@ defmodule Handoff.DistributedExecutor do
     # regression risk. When multiple independent functions are ready, dispatch them
     # in parallel so a slow task on one branch doesn't block other branches.
     {new_pending, new_to_be_executed, new_executed} =
-      if not match?([_, _ | _], ready_functions) do
-        Enum.reduce(
-          ready_functions,
-          {pending, to_be_executed, executed},
-          &execute_ready_function(dag, max_retries, &1, &2)
-        )
-      else
+      if match?([_, _ | _], ready_functions) do
         dispatch_ready_functions_concurrently(
           dag,
           ready_functions,
@@ -325,6 +334,12 @@ defmodule Handoff.DistributedExecutor do
           to_be_executed,
           executed,
           max_retries
+        )
+      else
+        Enum.reduce(
+          ready_functions,
+          {pending, to_be_executed, executed},
+          &execute_ready_function(dag, max_retries, &1, &2)
         )
       end
 
@@ -562,9 +577,7 @@ defmodule Handoff.DistributedExecutor do
   end
 
   defp accumulate_dispatch_result(_dag, {function_id, unexpected}, {p, tbe, ex}) do
-    Logger.error(
-      "Unexpected dispatch result for #{inspect(function_id)}: #{inspect(unexpected)}"
-    )
+    Logger.error("Unexpected dispatch result for #{inspect(function_id)}: #{inspect(unexpected)}")
 
     {p, MapSet.delete(tbe, function_id), Map.put(ex, function_id, {:error, unexpected})}
   end
