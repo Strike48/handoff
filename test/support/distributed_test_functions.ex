@@ -15,6 +15,8 @@ defmodule Handoff.DistributedTestFunctions do
 
   def exit_abnormally(_x), do: exit(:crash_isolation_boom)
 
+  def exit_normally(_x), do: exit(:normal)
+
   def slow_identity(x, sleep_ms) do
     Process.sleep(sleep_ms)
     x

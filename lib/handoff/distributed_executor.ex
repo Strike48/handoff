@@ -187,16 +187,22 @@ defmodule Handoff.DistributedExecutor do
   # not catch. Reply to the caller so it is not stuck in GenServer.call/3
   # forever, and carry on: other in-flight DAGs are unaffected.
   #
+  # The reply is unconditional, including reason :normal: a completed task
+  # always delivers its `{ref, result}` message *before* the :DOWN arrives
+  # (same-sender ordering) and that path demonitors with :flush — so a :DOWN
+  # for a ref still in `executing` means the task exited without a result
+  # (e.g. user code called `exit(:normal)`), which is a protocol violation,
+  # not a success. If `execute_dag` did already reply, the extra reply lands
+  # on a dead call alias and is dropped.
+  #
   # This clause must come before the `monitored`-keyed :DOWN clause below,
   # which matches any :process :DOWN message and would otherwise swallow
   # these (the pre-existing ref-keyed clause was unreachable because of it).
   @impl true
   def handle_info({:DOWN, ref, :process, _pid, reason}, %{executing: executing} = state)
       when is_map_key(executing, ref) do
-    if reason != :normal do
-      Logger.error("DAG execution task crashed: #{inspect(reason)}")
-      GenServer.reply(executing[ref], {:error, {:execution_crashed, reason}})
-    end
+    Logger.error("DAG execution task died without a result: #{inspect(reason)}")
+    GenServer.reply(executing[ref], {:error, {:execution_crashed, reason}})
 
     {:noreply, %{state | executing: Map.delete(executing, ref)}}
   end
