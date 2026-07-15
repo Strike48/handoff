@@ -13,6 +13,15 @@ defmodule Handoff.DistributedTestFunctions do
     raise message <> ", value: #{inspect(value)}"
   end
 
+  def exit_abnormally(_x), do: exit(:crash_isolation_boom)
+
+  def exit_normally(_x), do: exit(:normal)
+
+  def slow_identity(x, sleep_ms) do
+    Process.sleep(sleep_ms)
+    x
+  end
+
   def failing_function(x, agent) do
     count = Agent.get(agent, fn state -> state.count end)
     Agent.update(agent, fn state -> %{state | count: state.count + 1} end)

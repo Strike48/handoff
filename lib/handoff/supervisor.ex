@@ -24,9 +24,17 @@ defmodule Handoff.Supervisor do
       resource_tracker,
       {Handoff.DataLocationRegistry, []},
       {Handoff.DistributedExecutor, Keyword.put(opts, :resource_tracker, resource_tracker)},
+      # Runs DAG execution tasks unlinked from DistributedExecutor so a crash
+      # in one DAG cannot take down the executor (and with it every other
+      # in-flight DAG on the node). Placed AFTER the executor under
+      # :rest_for_one so an executor restart also restarts this supervisor,
+      # terminating in-flight DAG tasks — the restarted executor has no
+      # record of them, and orphans would keep executing side effects with
+      # nobody to reply to.
+      {Task.Supervisor, name: Handoff.DagTaskSupervisor},
       {Handoff.DistributedResultStore, []}
     ]
 
-    Supervisor.init(children, strategy: :one_for_one)
+    Supervisor.init(children, strategy: :rest_for_one)
   end
 end
