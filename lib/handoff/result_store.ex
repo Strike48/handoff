@@ -10,6 +10,8 @@ defmodule Handoff.ResultStore do
 
   require Logger
 
+  @table :handoff_results
+
   # Client API
 
   def start_link(_opts) do
@@ -29,6 +31,32 @@ defmodule Handoff.ResultStore do
   end
 
   @doc """
+  Stores a result without ever crashing the caller if the store is unresponsive.
+
+  `store/3` is a blocking `GenServer.call`; a timeout *exits* the calling
+  process with `{:timeout, {GenServer, :call, [__MODULE__, _msg, _t]}}`. On the
+  DAG execution path that exit kills the whole execution, surfaced to callers
+  as `{:error, {:execution_crashed, reason}}` (Strike48/matrix#3475).
+
+  This variant retries a bounded number of times and returns an error tuple
+  instead of exiting when the store stays unresponsive, so a slow store
+  degrades throughput instead of crashing executions.
+
+  Returns:
+  - `:ok` if the value was stored (possibly after retries)
+  - `{:error, :store_timeout}` if the store is still unresponsive after all attempts
+  - `{:error, :store_unavailable}` if the store process is not running
+
+  The per-attempt timeout (`:handoff, :result_store_timeout`, default 5000ms)
+  and retry budget (`:handoff, :result_store_attempts`, default 3 total
+  attempts) are overridable via the application environment, which tests use
+  to fail fast.
+  """
+  def store_safe(dag_id, id, value) do
+    attempt_store(dag_id, id, value, store_attempts(), store_timeout())
+  end
+
+  @doc """
   Retrieves a value by its ID from the local store for a specific DAG.
 
   ## Parameters
@@ -39,8 +67,20 @@ defmodule Handoff.ResultStore do
   - `{:ok, value}` if the value is found
   - `{:error, :not_found}` if no value exists for the ID in the given DAG
   """
+  # Read the ETS table directly instead of queueing a GenServer.call behind
+  # every other reader and writer. The store is a single serialized process;
+  # routing O(reads) through its mailbox is what let a slow handler back up
+  # the queue until callers timed out (Strike48/matrix#3475). Writes still go
+  # through the GenServer, so the table stays `:protected` (owner writes,
+  # everyone reads). Falls back to the GenServer if the table is not
+  # available (store process restarting).
   def get(dag_id, id) do
-    GenServer.call(__MODULE__, {:get, dag_id, id})
+    case :ets.lookup(@table, {dag_id, id}) do
+      [{{^dag_id, ^id}, value}] -> {:ok, value}
+      [] -> {:error, :not_found}
+    end
+  rescue
+    ArgumentError -> GenServer.call(__MODULE__, {:get, dag_id, id})
   end
 
   @doc """
@@ -97,8 +137,11 @@ defmodule Handoff.ResultStore do
       # The remote :get call must also pass dag_id
       case :rpc.call(source_node, __MODULE__, :get, [dag_id, id]) do
         {:ok, value} ->
-          # Cache the fetched value locally
-          store(dag_id, id, value)
+          # Cache the fetched value locally (best effort: the fetched value is
+          # returned to the caller regardless of whether the cache write
+          # lands, and store_safe keeps a slow store from exiting this
+          # process — Strike48/matrix#3475).
+          store_safe(dag_id, id, value)
           {:ok, value}
 
         {:error, reason} ->
@@ -128,7 +171,9 @@ defmodule Handoff.ResultStore do
   - false otherwise
   """
   def has_value?(dag_id, id) do
-    GenServer.call(__MODULE__, {:has_value, dag_id, id})
+    :ets.member(@table, {dag_id, id})
+  rescue
+    ArgumentError -> GenServer.call(__MODULE__, {:has_value, dag_id, id})
   end
 
   @doc """
@@ -146,7 +191,9 @@ defmodule Handoff.ResultStore do
   @impl true
   def init(_) do
     Logger.info("ResultStore init: #{inspect({self(), Node.self()})}")
-    table = :ets.new(:handoff_results, [:set, :private, :named_table, read_concurrency: true])
+    # :protected — the owning store process writes, any process may read (see
+    # the direct-read fast path in get/2 and has_value?/2).
+    table = :ets.new(@table, [:set, :protected, :named_table, read_concurrency: true])
     {:ok, %{table: table}}
   end
 
@@ -158,7 +205,16 @@ defmodule Handoff.ResultStore do
 
   @impl true
   def handle_call({:get, dag_id, id}, _from, state) do
-    Logger.info("ResultStore get: #{inspect(:ets.tab2list(state.table))}")
+    # Never dump the whole table here: `:ets.tab2list/1` copies every stored
+    # result (including large task outputs) and `inspect/1` stringifies it,
+    # all inside this single serialized GenServer. Under concurrent load that
+    # made every :get O(table size) and backed up the mailbox until :store
+    # callers timed out at 5s (Strike48/matrix#3475). Debug logging is
+    # opt-in via `config :handoff, debug_result_store: true` and logs only the
+    # requested key.
+    if Application.get_env(:handoff, :debug_result_store, false) do
+      Logger.debug("ResultStore get: dag_id=#{inspect(dag_id)} id=#{inspect(id)}")
+    end
 
     result =
       case :ets.lookup(state.table, {dag_id, id}) do
@@ -180,5 +236,38 @@ defmodule Handoff.ResultStore do
     match_spec = [{{{dag_id, :_}, :_}, [], [true]}]
     :ets.select_delete(state.table, match_spec)
     {:reply, :ok, state}
+  end
+
+  # Private helpers
+
+  defp store_attempts, do: Application.get_env(:handoff, :result_store_attempts, 3)
+  defp store_timeout, do: Application.get_env(:handoff, :result_store_timeout, 5_000)
+
+  # Bounded-retry wrapper around the blocking call. `GenServer.call` exits the
+  # caller on timeout (`:exit {:timeout, ...}`), so the retry loop must be a
+  # `try/catch` — a plain `case` would never see the failure.
+  defp attempt_store(dag_id, id, value, attempts, timeout) do
+    GenServer.call(__MODULE__, {:store, dag_id, id, value}, timeout)
+  catch
+    :exit, {:timeout, {GenServer, :call, [__MODULE__, _, _]}} ->
+      if attempts > 1 do
+        :timer.sleep(100 * attempts)
+        attempt_store(dag_id, id, value, attempts - 1, timeout)
+      else
+        Logger.error(
+          "Handoff.ResultStore still unresponsive after #{attempts} attempt(s); " <>
+            "result for dag_id=#{inspect(dag_id)} id=#{inspect(id)} was NOT stored"
+        )
+
+        {:error, :store_timeout}
+      end
+
+    :exit, :noproc ->
+      Logger.error(
+        "Handoff.ResultStore process is not running; " <>
+          "result for dag_id=#{inspect(dag_id)} id=#{inspect(id)} was NOT stored"
+      )
+
+      {:error, :store_unavailable}
   end
 end
