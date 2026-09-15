@@ -22,6 +22,8 @@ defmodule Handoff.DistributedTestFunctions do
     x
   end
 
+  def stored_value, do: "stored-value"
+
   def failing_function(x, agent) do
     count = Agent.get(agent, fn state -> state.count end)
     Agent.update(agent, fn state -> %{state | count: state.count + 1} end)

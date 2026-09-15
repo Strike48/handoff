@@ -105,11 +105,30 @@ defmodule Handoff.DistributedExecutor do
 
   @impl true
   def handle_call({:execute, dag, _opts}, from, state) do
-    # Clear any previous results for this DAG
-    ResultStore.clear(dag.id)
+    # Clear any previous results for this DAG. Best effort: this handler runs
+    # in the DistributedExecutor singleton, which must never exit on a
+    # blocking call to another GenServer — a ResultStore timeout here would
+    # take down every in-flight DAG on the node (and with it, the caller
+    # stuck in GenServer.call/3).
+    try do
+      GenServer.call(Handoff.ResultStore, {:clear, dag.id}, result_store_timeout())
+    catch
+      :exit, reason ->
+        Logger.error(
+          "Could not clear ResultStore for DAG #{inspect(dag.id)}: #{inspect(reason)}; " <>
+            "continuing with stale entries"
+        )
+    end
 
-    # Clear data location registry for this DAG
-    DataLocationRegistry.clear(dag.id)
+    # Clear data location registry for this DAG (same singleton-safety rule)
+    try do
+      DataLocationRegistry.clear(dag.id)
+    catch
+      :exit, reason ->
+        Logger.error(
+          "Could not clear DataLocationRegistry for DAG #{inspect(dag.id)}: #{inspect(reason)}"
+        )
+    end
 
     # Register initial arguments in the data location registry for this DAG
     dag.functions
@@ -462,11 +481,19 @@ defmodule Handoff.DistributedExecutor do
           {pending_acc, to_be_executed_acc, executed_acc}
 
         {:ok, result} ->
-          :ok = ResultStore.store(dag.id, function_id, result)
-          DataLocationRegistry.register(dag.id, function_id, function.node)
-          executed_acc = Map.put(executed_acc, function_id, result)
-          to_be_executed_acc = MapSet.delete(to_be_executed_acc, function_id)
-          {pending_acc, to_be_executed_acc, executed_acc}
+          case store_result(dag, function_id, function.node, result) do
+            :stored ->
+              executed_acc = Map.put(executed_acc, function_id, result)
+              to_be_executed_acc = MapSet.delete(to_be_executed_acc, function_id)
+              {pending_acc, to_be_executed_acc, executed_acc}
+
+            {:not_stored, reason} ->
+              executed_acc =
+                Map.put(executed_acc, function_id, {:error, {:result_store_unavailable, reason}})
+
+              to_be_executed_acc = MapSet.delete(to_be_executed_acc, function_id)
+              {pending_acc, to_be_executed_acc, executed_acc}
+          end
 
         {:async, _pid} ->
           to_be_executed_acc = MapSet.delete(to_be_executed_acc, function_id)
@@ -564,9 +591,15 @@ defmodule Handoff.DistributedExecutor do
 
   defp accumulate_dispatch_result(dag, {function_id, {:ok, result}}, {p, tbe, ex}) do
     function = Map.get(dag.functions, function_id)
-    :ok = ResultStore.store(dag.id, function_id, result)
-    DataLocationRegistry.register(dag.id, function_id, function.node)
-    {p, MapSet.delete(tbe, function_id), Map.put(ex, function_id, result)}
+
+    case store_result(dag, function_id, function.node, result) do
+      :stored ->
+        {p, MapSet.delete(tbe, function_id), Map.put(ex, function_id, result)}
+
+      {:not_stored, reason} ->
+        {p, MapSet.delete(tbe, function_id),
+         Map.put(ex, function_id, {:error, {:result_store_unavailable, reason}})}
+    end
   end
 
   defp accumulate_dispatch_result(_dag, {function_id, {:async, _pid}}, {p, tbe, ex}) do
@@ -817,6 +850,35 @@ defmodule Handoff.DistributedExecutor do
         )
 
       {[id | sorted], visited}
+    end
+  end
+
+  # Per-call timeout for ResultStore GenServer calls issued by the executor
+  # (best-effort clears and store_safe retries). Overridable via
+  # `config :handoff, result_store_timeout: <ms>` — tests use a short value to
+  # fail fast against a suspended store.
+  defp result_store_timeout, do: Application.get_env(:handoff, :result_store_timeout, 5_000)
+
+  # Persists a function result (and registers its data location) without ever
+  # exiting the caller. `GenServer.call` exits the caller on timeout, which
+  # used to kill the DAG execution task right here and surface as
+  # {:error, {:execution_crashed, reason}} (Strike48/matrix#3475). A store that
+  # stays unresponsive is reported via the return value so the executor can
+  # attribute the failure to the affected function instead of crashing the
+  # whole execution.
+  defp store_result(dag, function_id, node, result) do
+    case ResultStore.store_safe(dag.id, function_id, result) do
+      :ok ->
+        DataLocationRegistry.register(dag.id, function_id, node)
+        :stored
+
+      {:error, reason} ->
+        Logger.error(
+          "ResultStore unavailable; function #{inspect(function_id)} (dag #{inspect(dag.id)}) " <>
+            "result was not persisted: #{inspect(reason)}. Marking function failed."
+        )
+
+        {:not_stored, reason}
     end
   end
 
