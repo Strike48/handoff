@@ -107,6 +107,26 @@ defmodule Handoff.ResultStoreSlowStoreTest do
       assert :ok = ResultStore.store_safe(@dag_id, :fn, "value")
       assert {:ok, "value"} = ResultStore.get(@dag_id, :fn)
     end
+
+    test "reads are lock-free — get/has_value? do not queue on the store process" do
+      assert :ok = ResultStore.store(@dag_id, :k, "value")
+
+      # Suspended == alive but not processing its mailbox. Reads used to be
+      # GenServer.call/3, so they would block here until the 5s timeout and
+      # exit the caller (the #3475 failure mode); direct ETS reads return
+      # immediately.
+      suspend_store!()
+
+      start = System.monotonic_time(:millisecond)
+      assert {:ok, "value"} = ResultStore.get(@dag_id, :k)
+      assert ResultStore.has_value?(@dag_id, :k)
+      assert {:error, :not_found} = ResultStore.get(@dag_id, :missing)
+      refute ResultStore.has_value?(@dag_id, :missing)
+      elapsed = System.monotonic_time(:millisecond) - start
+
+      assert elapsed < 100,
+             "store reads took #{elapsed}ms while the process was suspended — reads are not lock-free"
+    end
   end
 
   describe "DAG execution against a slow store" do

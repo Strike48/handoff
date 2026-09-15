@@ -10,6 +10,8 @@ defmodule Handoff.ResultStore do
 
   require Logger
 
+  @table :handoff_results
+
   # Client API
 
   def start_link(_opts) do
@@ -65,8 +67,20 @@ defmodule Handoff.ResultStore do
   - `{:ok, value}` if the value is found
   - `{:error, :not_found}` if no value exists for the ID in the given DAG
   """
+  # Read the ETS table directly instead of queueing a GenServer.call behind
+  # every other reader and writer. The store is a single serialized process;
+  # routing O(reads) through its mailbox is what let a slow handler back up
+  # the queue until callers timed out (Strike48/matrix#3475). Writes still go
+  # through the GenServer, so the table stays `:protected` (owner writes,
+  # everyone reads). Falls back to the GenServer if the table is not
+  # available (store process restarting).
   def get(dag_id, id) do
-    GenServer.call(__MODULE__, {:get, dag_id, id})
+    case :ets.lookup(@table, {dag_id, id}) do
+      [{{^dag_id, ^id}, value}] -> {:ok, value}
+      [] -> {:error, :not_found}
+    end
+  rescue
+    ArgumentError -> GenServer.call(__MODULE__, {:get, dag_id, id})
   end
 
   @doc """
@@ -157,7 +171,9 @@ defmodule Handoff.ResultStore do
   - false otherwise
   """
   def has_value?(dag_id, id) do
-    GenServer.call(__MODULE__, {:has_value, dag_id, id})
+    :ets.member(@table, {dag_id, id})
+  rescue
+    ArgumentError -> GenServer.call(__MODULE__, {:has_value, dag_id, id})
   end
 
   @doc """
@@ -175,7 +191,9 @@ defmodule Handoff.ResultStore do
   @impl true
   def init(_) do
     Logger.info("ResultStore init: #{inspect({self(), Node.self()})}")
-    table = :ets.new(:handoff_results, [:set, :private, :named_table, read_concurrency: true])
+    # :protected — the owning store process writes, any process may read (see
+    # the direct-read fast path in get/2 and has_value?/2).
+    table = :ets.new(@table, [:set, :protected, :named_table, read_concurrency: true])
     {:ok, %{table: table}}
   end
 
