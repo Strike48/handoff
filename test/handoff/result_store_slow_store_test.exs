@@ -265,6 +265,26 @@ defmodule Handoff.ResultStoreSlowStoreTest do
     end
   end
 
+  describe "the executor singleton under a slow store" do
+    test "a run starting during a store stall does not crash a run already in flight" do
+      # One store call longer than GenServer.call's default 5s: before the
+      # fix the singleton made this call in handle_call({:execute, ...}), so a
+      # running DAG's call into the singleton timed out behind it.
+      Application.put_env(:handoff, :result_store_timeout, 6_000)
+      Application.put_env(:handoff, :result_store_attempts, 1)
+      suspend_store!()
+
+      run_a = Task.async(fn -> DistributedExecutor.execute(single_fn_dag(:fn_a)) end)
+      # Let run A's execute reach the singleton first.
+      Process.sleep(100)
+      run_b = Task.async(fn -> DistributedExecutor.execute(single_fn_dag(:fn_b)) end)
+
+      for run <- [run_a, run_b] do
+        assert {:ok, %{results: _}} = Task.await(run, 60_000)
+      end
+    end
+  end
+
   describe "DAG execution against a slow store" do
     test "a suspended store does not crash the execution with :execution_crashed" do
       suspend_store!()
