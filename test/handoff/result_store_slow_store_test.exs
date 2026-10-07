@@ -60,6 +60,20 @@ defmodule Handoff.ResultStoreSlowStoreTest do
     :sys.resume(Handoff.ResultStore)
   end
 
+  defp wait_until(fun, attempts \\ 200) do
+    cond do
+      fun.() ->
+        :ok
+
+      attempts <= 0 ->
+        flunk("condition never became true")
+
+      true ->
+        Process.sleep(5)
+        wait_until(fun, attempts - 1)
+    end
+  end
+
   defp single_fn_dag(fn_id) do
     make_ref()
     |> DAG.new()
@@ -88,17 +102,28 @@ defmodule Handoff.ResultStoreSlowStoreTest do
 
       elapsed = System.monotonic_time(:millisecond) - start
 
-      # 3 attempts x 100ms timeout + 300ms + 200ms backoff, but nowhere near
-      # the old behaviour where the caller process simply died.
-      assert elapsed >= 600
+      # One call with a 3 x 100ms budget, but nowhere near the old behaviour
+      # where the caller process simply died.
+      assert elapsed >= 300
       assert elapsed < 3_000
       assert Process.alive?(self())
     end
 
-    test "retries and succeeds when the store recovers mid-way" do
+    test "a timed-out write queues the value once, not once per attempt" do
       suspend_store!()
 
-      # Bring the store back during the retry window.
+      assert {:error, :store_timeout} = ResultStore.store_safe(@dag_id, :fn, "value")
+
+      {:message_queue_len, queued} =
+        Process.info(Process.whereis(ResultStore), :message_queue_len)
+
+      assert queued == 1
+    end
+
+    test "succeeds when the store recovers within the call's budget" do
+      suspend_store!()
+
+      # Bring the store back while the call is still waiting.
       Task.start(fn ->
         :timer.sleep(150)
         resume_store!()
@@ -142,6 +167,21 @@ defmodule Handoff.ResultStoreSlowStoreTest do
       # GenServer.call to a dead name exits with {:noproc, {GenServer, :call, _}}.
       assert {:error, :store_unavailable} = ResultStore.store_safe(@dag_id, :fn, "value")
       assert Process.alive?(self())
+    end
+
+    test "store_safe returns an error instead of exiting when the store dies mid-call" do
+      Application.put_env(:handoff, :result_store_timeout, 1_000)
+      suspend_store!()
+      store = Process.whereis(ResultStore)
+
+      call = Task.async(fn -> ResultStore.store_safe(@dag_id, :fn, "value") end)
+
+      wait_until(fn -> Process.info(store, :message_queue_len) == {:message_queue_len, 1} end)
+      Process.exit(store, :kill)
+
+      # The pending call exits with {:killed, {GenServer, :call, _}}.
+      assert {:error, :store_unavailable} = Task.await(call, 5_000)
+      wait_until(fn -> is_pid(Process.whereis(ResultStore)) end)
     end
 
     test "a stalled location registry does not crash the execution or the executor" do

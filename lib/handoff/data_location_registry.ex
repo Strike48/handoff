@@ -87,6 +87,25 @@ defmodule Handoff.DataLocationRegistry do
   end
 
   @doc """
+  Like `register/3`, but never exits the caller: returns
+  `{:error, :registry_unavailable}` if the registry is slow or not running.
+  For callers that must not exit (the executor singleton, an execution task).
+  A failed registration only loses the location hint; local reads go to the
+  ResultStore first.
+  """
+  def register_safe(dag_id, data_id, node_id) do
+    register(dag_id, data_id, node_id)
+  catch
+    :exit, reason ->
+      Logger.error(
+        "Could not register location of #{inspect(data_id)} for DAG #{inspect(dag_id)}: " <>
+          inspect(reason)
+      )
+
+      {:error, :registry_unavailable}
+  end
+
+  @doc """
   Clears all registered data locations for a specific DAG.
 
   ## Parameters

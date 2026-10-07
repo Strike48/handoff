@@ -38,22 +38,42 @@ defmodule Handoff.ResultStore do
   DAG execution path that exit kills the whole execution, surfaced to callers
   as `{:error, {:execution_crashed, reason}}` (Strike48/matrix#3475).
 
-  This variant retries a bounded number of times and returns an error tuple
-  instead of exiting when the store stays unresponsive, so a slow store
-  degrades throughput instead of crashing executions.
+  This variant makes ONE call with the whole time budget and returns an error
+  tuple instead of exiting when the store stays unresponsive, so a slow store
+  degrades throughput instead of crashing executions. It does not retry: a
+  timed-out call leaves its message in the store's mailbox, so a retry would
+  queue a second full copy of the value behind the first.
 
   Returns:
-  - `:ok` if the value was stored (possibly after retries)
-  - `{:error, :store_timeout}` if the store is still unresponsive after all attempts
-  - `{:error, :store_unavailable}` if the store process is not running
+  - `:ok` if the value was stored
+  - `{:error, :store_timeout}` if the store did not answer within the budget
+  - `{:error, :store_unavailable}` if the store process is not running or
+    exited during the call
 
-  The per-attempt timeout (`:handoff, :result_store_timeout`, default 5000ms)
-  and retry budget (`:handoff, :result_store_attempts`, default 3 total
-  attempts) are overridable via the application environment, which tests use
-  to fail fast.
+  The budget is `:result_store_timeout` (default 5000ms) times
+  `:result_store_attempts` (default 3), both overridable via the application
+  environment, which tests use to fail fast.
   """
   def store_safe(dag_id, id, value) do
-    attempt_store(dag_id, id, value, store_attempts(), store_timeout())
+    GenServer.call(__MODULE__, {:store, dag_id, id, value}, store_attempts() * store_timeout())
+  catch
+    :exit, {:timeout, {GenServer, :call, _}} ->
+      Logger.error(
+        "Handoff.ResultStore unresponsive; " <>
+          "result for dag_id=#{inspect(dag_id)} id=#{inspect(id)} was NOT stored"
+      )
+
+      {:error, :store_timeout}
+
+    # A dead name exits with {:noproc, {GenServer, :call, _}}; a store that is
+    # restarted mid-call exits with {:shutdown | :killed | reason, ...}.
+    :exit, reason ->
+      Logger.error(
+        "Handoff.ResultStore unavailable (#{inspect(reason)}); " <>
+          "result for dag_id=#{inspect(dag_id)} id=#{inspect(id)} was NOT stored"
+      )
+
+      {:error, :store_unavailable}
   end
 
   @doc """
@@ -242,34 +262,4 @@ defmodule Handoff.ResultStore do
 
   defp store_attempts, do: Application.get_env(:handoff, :result_store_attempts, 3)
   defp store_timeout, do: Application.get_env(:handoff, :result_store_timeout, 5_000)
-
-  # Bounded-retry wrapper around the blocking call. `GenServer.call` exits the
-  # caller on timeout (`:exit {:timeout, ...}`), so the retry loop must be a
-  # `try/catch` — a plain `case` would never see the failure.
-  defp attempt_store(dag_id, id, value, attempts, timeout) do
-    GenServer.call(__MODULE__, {:store, dag_id, id, value}, timeout)
-  catch
-    :exit, {:timeout, {GenServer, :call, [__MODULE__, _, _]}} ->
-      if attempts > 1 do
-        :timer.sleep(100 * attempts)
-        attempt_store(dag_id, id, value, attempts - 1, timeout)
-      else
-        Logger.error(
-          "Handoff.ResultStore still unresponsive after #{attempts} attempt(s); " <>
-            "result for dag_id=#{inspect(dag_id)} id=#{inspect(id)} was NOT stored"
-        )
-
-        {:error, :store_timeout}
-      end
-
-    # A call to a name with no process exits with
-    # `{:noproc, {GenServer, :call, [...]}}`, not a bare `:noproc`.
-    :exit, {:noproc, _} ->
-      Logger.error(
-        "Handoff.ResultStore process is not running; " <>
-          "result for dag_id=#{inspect(dag_id)} id=#{inspect(id)} was NOT stored"
-      )
-
-      {:error, :store_unavailable}
-  end
 end

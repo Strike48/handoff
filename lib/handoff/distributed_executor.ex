@@ -148,7 +148,7 @@ defmodule Handoff.DistributedExecutor do
       arg_id ->
         # Only register if it's a literal value, not a function ID
         if not Map.has_key?(dag.functions, arg_id) do
-          register_location(dag.id, arg_id, Node.self())
+          DataLocationRegistry.register_safe(dag.id, arg_id, Node.self())
         end
     end)
 
@@ -386,8 +386,9 @@ defmodule Handoff.DistributedExecutor do
   defp pending_deadline_exceeded?(:infinity), do: false
   defp pending_deadline_exceeded?(deadline), do: System.monotonic_time(:millisecond) > deadline
 
-  # How long a pending (async) result may be awaited before the function is
-  # failed. Override with `config :handoff, pending_timeout: <ms | :infinity>`.
+  # How long, counted from the start of the DAG execution, pending (async)
+  # results may be awaited; past that, every still-pending function is failed.
+  # Override with `config :handoff, pending_timeout: <ms | :infinity>`.
   defp pending_timeout_ms, do: Application.get_env(:handoff, :pending_timeout, 1_800_000)
 
   defp do_execute_functions_with_deps(
@@ -845,7 +846,7 @@ defmodule Handoff.DistributedExecutor do
            all_dag_functions
          ]) do
       {:ok, :result_stored_locally} ->
-        register_location(dag_id, function.id, function.node)
+        DataLocationRegistry.register_safe(dag_id, function.id, function.node)
         {:ok, {:remote_store_and_registry_ok, function.id, function.node}}
 
       {:error, reason} ->
@@ -932,7 +933,7 @@ defmodule Handoff.DistributedExecutor do
   defp store_result(dag, function_id, node, result) do
     case ResultStore.store_safe(dag.id, function_id, result) do
       :ok ->
-        register_location(dag.id, function_id, node)
+        DataLocationRegistry.register_safe(dag.id, function_id, node)
         :stored
 
       {:error, reason} ->
@@ -943,23 +944,6 @@ defmodule Handoff.DistributedExecutor do
 
         {:not_stored, reason}
     end
-  end
-
-  # Registers a data location without ever exiting the caller. Two callers run
-  # in places that must not exit: the singleton's handle_call({:execute, ...})
-  # (an exit there takes down every in-flight DAG on the node) and the
-  # execution task (an exit there crashes the run). A failed registration
-  # only loses the location hint; local reads go to the ResultStore first.
-  defp register_location(dag_id, data_id, node) do
-    DataLocationRegistry.register(dag_id, data_id, node)
-  catch
-    :exit, reason ->
-      Logger.error(
-        "Could not register location of #{inspect(data_id)} for DAG #{inspect(dag_id)}: " <>
-          inspect(reason)
-      )
-
-      {:error, :registry_unavailable}
   end
 
   # New helper function to fetch arguments from appropriate nodes
