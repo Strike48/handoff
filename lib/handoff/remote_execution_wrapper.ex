@@ -38,8 +38,13 @@ defmodule Handoff.RemoteExecutionWrapper do
       # 2. Execute the function code
       actual_result = execute_code(function_struct, resolved_args, all_dag_functions)
 
-      # 3. Store result in this node's local ResultStore
-      case ResultStore.store(dag_id, function_struct.id, actual_result) do
+      # 3. Store result in this node's local ResultStore.
+      # store_safe/3: a raw store/3 timeout would exit this worker task
+      # (GenServer.call exits the caller on timeout) before the case below
+      # could react; store_safe makes one bounded call and returns an error
+      # tuple instead
+      # (Strike48/matrix#3475).
+      case ResultStore.store_safe(dag_id, function_struct.id, actual_result) do
         :ok ->
           # 4. Return success confirmation
           {:ok, :result_stored_locally}
@@ -177,8 +182,9 @@ defmodule Handoff.RemoteExecutionWrapper do
       # Get from remote node
       case :rpc.call(source_node, ResultStore, :get, [dag_id, arg_id]) do
         {:ok, value} ->
-          # Cache locally for future use
-          ResultStore.store(dag_id, arg_id, value)
+          # Cache locally for future use. Best effort: the value is already in
+          # hand, so a slow store must not exit this remote execution.
+          _ = ResultStore.store_safe(dag_id, arg_id, value)
           value
 
         {:error, reason} ->

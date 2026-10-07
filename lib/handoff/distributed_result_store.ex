@@ -27,17 +27,25 @@ defmodule Handoff.DistributedResultStore do
   - function_id: The ID of the function
   - result: The result to store
   - origin_node: The node where the result was produced
+
+  Returns `:ok`, or `{:error, reason}` if the local store stays unresponsive
+  (see `Handoff.ResultStore.store_safe/3`; the location is then not
+  registered, since nothing was stored there) or the location could not be
+  registered (`Handoff.DataLocationRegistry.register_safe/3`).
   """
   def store_distributed(dag_id, function_id, result, origin_node \\ Node.self()) do
-    # Store locally if this is the origin node
-    if origin_node == Node.self() do
-      ResultStore.store(dag_id, function_id, result)
+    # Store locally if this is the origin node. store_safe/3: a slow store must
+    # not exit the caller (Strike48/matrix#3475).
+    stored =
+      if origin_node == Node.self() do
+        ResultStore.store_safe(dag_id, function_id, result)
+      else
+        :ok
+      end
+
+    with :ok <- stored do
+      DataLocationRegistry.register_safe(dag_id, function_id, origin_node)
     end
-
-    # Register the result location
-    DataLocationRegistry.register(dag_id, function_id, origin_node)
-
-    :ok
   end
 
   @doc """

@@ -91,4 +91,35 @@ defmodule Handoff.DataLocationRegistryTest do
       assert DataLocationRegistry.get_all(@dag_id_b) == %{data_b1: node}
     end
   end
+
+  describe "lock-free reads (Strike48/matrix#3475)" do
+    test "lookup and get_all answer without the registry process" do
+      node = Node.self()
+      :ok = DataLocationRegistry.register(@dag_id_a, :k, node)
+
+      # Suspended == alive but not processing its mailbox. Reads used to be
+      # GenServer.call/3 and would block (then exit the caller) here.
+      on_exit(fn -> :sys.resume(DataLocationRegistry) end)
+      :ok = :sys.suspend(DataLocationRegistry)
+
+      start = System.monotonic_time(:millisecond)
+      assert {:ok, ^node} = DataLocationRegistry.lookup(@dag_id_a, :k)
+      assert DataLocationRegistry.get_all(@dag_id_a) == %{k: node}
+      elapsed = System.monotonic_time(:millisecond) - start
+
+      assert elapsed < 100,
+             "registry reads took #{elapsed}ms while the process was suspended — reads are not lock-free"
+    end
+
+    test "clearing one DAG is scoped and does not need a full-state rebuild" do
+      node = Node.self()
+      :ok = DataLocationRegistry.register(@dag_id_a, :data_a1, node)
+      :ok = DataLocationRegistry.register(@dag_id_b, :data_b1, node)
+
+      assert :ok = DataLocationRegistry.clear(@dag_id_a)
+
+      assert {:error, :not_found} = DataLocationRegistry.lookup(@dag_id_a, :data_a1)
+      assert {:ok, ^node} = DataLocationRegistry.lookup(@dag_id_b, :data_b1)
+    end
+  end
 end

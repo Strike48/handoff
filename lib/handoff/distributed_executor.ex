@@ -59,6 +59,10 @@ defmodule Handoff.DistributedExecutor do
     # Schedule periodic heartbeat
     :timer.send_interval(heartbeat_interval, :check_nodes)
 
+    # DAG tasks read the tracker from here instead of calling back into this
+    # singleton, which may be busy (see resource_tracker/0).
+    :persistent_term.put({__MODULE__, :resource_tracker}, resource_tracker)
+
     {:ok,
      %{
        # Available nodes and their capabilities
@@ -105,34 +109,6 @@ defmodule Handoff.DistributedExecutor do
 
   @impl true
   def handle_call({:execute, dag, _opts}, from, state) do
-    # Clear any previous results for this DAG
-    ResultStore.clear(dag.id)
-
-    # Clear data location registry for this DAG
-    DataLocationRegistry.clear(dag.id)
-
-    # Register initial arguments in the data location registry for this DAG
-    dag.functions
-    |> Map.values()
-    |> get_in([Access.all(), Access.key(:args)])
-    |> List.flatten()
-    |> Enum.each(fn
-      nil ->
-        :ok
-
-      {:serialize, _, _, _, _} ->
-        :ok
-
-      {:deserialize, _, _, _, _} ->
-        :ok
-
-      arg_id ->
-        # Only register if it's a literal value, not a function ID
-        if not Map.has_key?(dag.functions, arg_id) do
-          DataLocationRegistry.register(dag.id, arg_id, Node.self())
-        end
-    end)
-
     # If no nodes are known, discover them
     state =
       if map_size(state.nodes) == 0 do
@@ -156,6 +132,7 @@ defmodule Handoff.DistributedExecutor do
     task =
       Task.Supervisor.async_nolink(Handoff.DagTaskSupervisor, fn ->
         try do
+          prepare_dag_namespace(dag)
           execute_dag(dag, from, state.max_retries)
         rescue
           e in [AllocationError] ->
@@ -257,9 +234,51 @@ defmodule Handoff.DistributedExecutor do
 
   # Private functions
 
+  # Clears this DAG's namespace and registers its literal arguments. Runs in
+  # the DAG's own task, NOT in the singleton's handle_call: these are
+  # blocking calls to the ResultStore/DataLocationRegistry, and while the
+  # singleton waits on them every running DAG's call into it (and every new
+  # execute/2) queues behind, until those callers time out and crash
+  # (Strike48/matrix#3475).
+  defp prepare_dag_namespace(dag) do
+    # Clear any previous results for this DAG. Best effort: a slow store must
+    # not fail the run (a timed-out clear still runs once the store catches up).
+    with {:error, reason} <- ResultStore.clear_safe(dag.id) do
+      Logger.error("Could not clear ResultStore for DAG #{inspect(dag.id)}: #{inspect(reason)}")
+    end
+
+    with {:error, reason} <- DataLocationRegistry.clear_safe(dag.id) do
+      Logger.error(
+        "Could not clear DataLocationRegistry for DAG #{inspect(dag.id)}: #{inspect(reason)}"
+      )
+    end
+
+    # Register initial arguments in the data location registry for this DAG
+    dag.functions
+    |> Map.values()
+    |> get_in([Access.all(), Access.key(:args)])
+    |> List.flatten()
+    |> Enum.each(fn
+      nil ->
+        :ok
+
+      {:serialize, _, _, _, _} ->
+        :ok
+
+      {:deserialize, _, _, _, _} ->
+        :ok
+
+      arg_id ->
+        # Only register if it's a literal value, not a function ID
+        if not Map.has_key?(dag.functions, arg_id) do
+          DataLocationRegistry.register_safe(dag.id, arg_id, Node.self())
+        end
+    end)
+  end
+
   defp execute_dag(dag, caller, max_retries) do
     # Get node capabilities from the tracker
-    tracker = GenServer.call(__MODULE__, :get_resource_tracker)
+    tracker = resource_tracker()
 
     node_caps =
       Enum.reduce([Node.self() | Node.list()], %{}, fn node, acc ->
@@ -462,11 +481,19 @@ defmodule Handoff.DistributedExecutor do
           {pending_acc, to_be_executed_acc, executed_acc}
 
         {:ok, result} ->
-          :ok = ResultStore.store(dag.id, function_id, result)
-          DataLocationRegistry.register(dag.id, function_id, function.node)
-          executed_acc = Map.put(executed_acc, function_id, result)
-          to_be_executed_acc = MapSet.delete(to_be_executed_acc, function_id)
-          {pending_acc, to_be_executed_acc, executed_acc}
+          case store_result(dag, function_id, function.node, result) do
+            :stored ->
+              executed_acc = Map.put(executed_acc, function_id, result)
+              to_be_executed_acc = MapSet.delete(to_be_executed_acc, function_id)
+              {pending_acc, to_be_executed_acc, executed_acc}
+
+            {:not_stored, reason} ->
+              executed_acc =
+                Map.put(executed_acc, function_id, {:error, {:result_store_unavailable, reason}})
+
+              to_be_executed_acc = MapSet.delete(to_be_executed_acc, function_id)
+              {pending_acc, to_be_executed_acc, executed_acc}
+          end
 
         {:async, _pid} ->
           to_be_executed_acc = MapSet.delete(to_be_executed_acc, function_id)
@@ -564,9 +591,15 @@ defmodule Handoff.DistributedExecutor do
 
   defp accumulate_dispatch_result(dag, {function_id, {:ok, result}}, {p, tbe, ex}) do
     function = Map.get(dag.functions, function_id)
-    :ok = ResultStore.store(dag.id, function_id, result)
-    DataLocationRegistry.register(dag.id, function_id, function.node)
-    {p, MapSet.delete(tbe, function_id), Map.put(ex, function_id, result)}
+
+    case store_result(dag, function_id, function.node, result) do
+      :stored ->
+        {p, MapSet.delete(tbe, function_id), Map.put(ex, function_id, result)}
+
+      {:not_stored, reason} ->
+        {p, MapSet.delete(tbe, function_id),
+         Map.put(ex, function_id, {:error, {:result_store_unavailable, reason}})}
+    end
   end
 
   defp accumulate_dispatch_result(_dag, {function_id, {:async, _pid}}, {p, tbe, ex}) do
@@ -648,8 +681,16 @@ defmodule Handoff.DistributedExecutor do
       end
   end
 
+  # The tracker module, without a call into the (possibly busy) singleton.
+  defp resource_tracker do
+    case :persistent_term.get({__MODULE__, :resource_tracker}, nil) do
+      nil -> GenServer.call(__MODULE__, :get_resource_tracker)
+      tracker -> tracker
+    end
+  end
+
   defp maybe_request_resources(function) do
-    tracker = GenServer.call(__MODULE__, :get_resource_tracker)
+    tracker = resource_tracker()
 
     if function.cost && function.node do
       case tracker.request(function.node, function.cost) do
@@ -662,7 +703,7 @@ defmodule Handoff.DistributedExecutor do
   end
 
   defp maybe_release_resources(function, resources_requested?) do
-    tracker = GenServer.call(__MODULE__, :get_resource_tracker)
+    tracker = resource_tracker()
 
     if resources_requested? do
       tracker.release(function.node, function.cost)
@@ -749,8 +790,13 @@ defmodule Handoff.DistributedExecutor do
            all_dag_functions
          ]) do
       {:ok, :result_stored_locally} ->
-        DataLocationRegistry.register(dag_id, function.id, function.node)
-        {:ok, {:remote_store_and_registry_ok, function.id, function.node}}
+        # Without a registered location no consumer can find the remote
+        # result, so a failed registration fails this function here instead
+        # of a downstream one later.
+        case DataLocationRegistry.register_safe(dag_id, function.id, function.node) do
+          :ok -> {:ok, {:remote_store_and_registry_ok, function.id, function.node}}
+          {:error, reason} -> {:error, reason}
+        end
 
       {:error, reason} ->
         {:error, reason}
@@ -820,6 +866,29 @@ defmodule Handoff.DistributedExecutor do
     end
   end
 
+  # Persists a function result (and registers its data location) without ever
+  # exiting the caller. `GenServer.call` exits the caller on timeout, which
+  # used to kill the DAG execution task right here and surface as
+  # {:error, {:execution_crashed, reason}} (Strike48/matrix#3475). A store that
+  # stays unresponsive is reported via the return value so the executor can
+  # attribute the failure to the affected function instead of crashing the
+  # whole execution.
+  defp store_result(dag, function_id, node, result) do
+    case ResultStore.store_safe(dag.id, function_id, result) do
+      :ok ->
+        DataLocationRegistry.register_safe(dag.id, function_id, node)
+        :stored
+
+      {:error, reason} ->
+        Logger.error(
+          "ResultStore unavailable; function #{inspect(function_id)} (dag #{inspect(dag.id)}) " <>
+            "result was not persisted: #{inspect(reason)}. Marking function failed."
+        )
+
+        {:not_stored, reason}
+    end
+  end
+
   # New helper function to fetch arguments from appropriate nodes
   defp fetch_arguments(dag_id, arg_ids, executed_results, target_node, all_dag_functions) do
     if target_node == Node.self() or target_node == nil do
@@ -851,7 +920,9 @@ defmodule Handoff.DistributedExecutor do
         # Find where the result is stored
         with {:ok, source_node} <- DataLocationRegistry.lookup(dag_id, arg_id),
              {:ok, actual_value} <- :rpc.call(source_node, ResultStore, :get, [dag_id, arg_id]) do
-          ResultStore.store(dag_id, arg_id, actual_value)
+          # Local cache of a value we already hold: a failed write only costs
+          # a re-fetch later, so it must not exit the execution task.
+          _ = ResultStore.store_safe(dag_id, arg_id, actual_value)
           actual_value
         else
           {:error, :not_found} ->
