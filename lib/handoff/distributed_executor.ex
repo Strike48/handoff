@@ -242,25 +242,15 @@ defmodule Handoff.DistributedExecutor do
   # (Strike48/matrix#3475).
   defp prepare_dag_namespace(dag) do
     # Clear any previous results for this DAG. Best effort: a slow store must
-    # not fail the run.
-    try do
-      GenServer.call(Handoff.ResultStore, {:clear, dag.id}, result_store_timeout())
-    catch
-      :exit, reason ->
-        Logger.error(
-          "Could not clear ResultStore for DAG #{inspect(dag.id)}: #{inspect(reason)}; " <>
-            "continuing with stale entries"
-        )
+    # not fail the run (a timed-out clear still runs once the store catches up).
+    with {:error, reason} <- ResultStore.clear_safe(dag.id) do
+      Logger.error("Could not clear ResultStore for DAG #{inspect(dag.id)}: #{inspect(reason)}")
     end
 
-    # Clear data location registry for this DAG (same best-effort rule)
-    try do
-      DataLocationRegistry.clear(dag.id)
-    catch
-      :exit, reason ->
-        Logger.error(
-          "Could not clear DataLocationRegistry for DAG #{inspect(dag.id)}: #{inspect(reason)}"
-        )
+    with {:error, reason} <- DataLocationRegistry.clear_safe(dag.id) do
+      Logger.error(
+        "Could not clear DataLocationRegistry for DAG #{inspect(dag.id)}: #{inspect(reason)}"
+      )
     end
 
     # Register initial arguments in the data location registry for this DAG
@@ -312,7 +302,6 @@ defmodule Handoff.DistributedExecutor do
       to_be_executed = MapSet.new(topo_sorted)
       executed = %{}
       pending = MapSet.new()
-      deadline = pending_deadline()
 
       results =
         execute_functions_with_deps(
@@ -320,8 +309,7 @@ defmodule Handoff.DistributedExecutor do
           to_be_executed,
           executed,
           pending,
-          max_retries,
-          deadline
+          max_retries
         )
 
       # All functions executed successfully (AllocationError exceptions would have bubbled up)
@@ -339,76 +327,16 @@ defmodule Handoff.DistributedExecutor do
     end
   end
 
-  # Executes functions until nothing is left to run. `pending` holds functions
-  # whose results are expected to appear in the ResultStore asynchronously; the
-  # loop re-checks them every ~100ms. Without a deadline a result that never
-  # arrives (e.g. cleared by a colliding DAG id — Strike48/matrix#3475) would be
-  # polled forever, so past `pending_timeout_ms/0` the remaining pending
-  # functions are failed instead.
-  defp execute_functions_with_deps(dag, to_be_executed, executed, pending, max_retries, deadline) do
-    cond do
-      MapSet.size(to_be_executed) == 0 and MapSet.size(pending) == 0 ->
-        # All functions executed, return results
-        executed
-
-      MapSet.size(pending) > 0 and pending_deadline_exceeded?(deadline) ->
-        timeout_ms = pending_timeout_ms()
-
-        Logger.error(
-          "Pending function(s) #{inspect(MapSet.to_list(pending))} for DAG #{inspect(dag.id)} " <>
-            "exceeded the #{timeout_ms}ms pending timeout; failing them instead of polling forever"
-        )
-
-        timed_out_executed =
-          Enum.reduce(pending, executed, fn function_id, acc ->
-            Map.put(acc, function_id, {:error, {:pending_timeout, timeout_ms}})
-          end)
-
-        execute_functions_with_deps(
-          dag,
-          to_be_executed,
-          timed_out_executed,
-          MapSet.new(),
-          max_retries,
-          deadline
-        )
-
-      true ->
-        do_execute_functions_with_deps(
-          dag,
-          to_be_executed,
-          executed,
-          pending,
-          max_retries,
-          deadline
-        )
+  defp execute_functions_with_deps(dag, to_be_executed, executed, pending, max_retries) do
+    if MapSet.size(to_be_executed) == 0 and MapSet.size(pending) == 0 do
+      # All functions executed, return results
+      executed
+    else
+      do_execute_functions_with_deps(dag, to_be_executed, executed, pending, max_retries)
     end
   end
 
-  # Monotonic deadline for the whole pending phase. `:infinity` disables it.
-  defp pending_deadline do
-    case pending_timeout_ms() do
-      :infinity -> :infinity
-      ms -> System.monotonic_time(:millisecond) + ms
-    end
-  end
-
-  defp pending_deadline_exceeded?(:infinity), do: false
-  defp pending_deadline_exceeded?(deadline), do: System.monotonic_time(:millisecond) > deadline
-
-  # How long, counted from the start of the DAG execution, pending (async)
-  # results may be awaited; past that, every still-pending function is failed.
-  # Override with `config :handoff, pending_timeout: <ms | :infinity>`.
-  defp pending_timeout_ms, do: Application.get_env(:handoff, :pending_timeout, 1_800_000)
-
-  defp do_execute_functions_with_deps(
-         dag,
-         to_be_executed,
-         executed,
-         pending,
-         max_retries,
-         deadline
-       ) do
+  defp do_execute_functions_with_deps(dag, to_be_executed, executed, pending, max_retries) do
     # Find ready functions (all deps satisfied and not pending)
     ready_functions =
       Enum.filter(to_be_executed, fn function_id ->
@@ -483,8 +411,7 @@ defmodule Handoff.DistributedExecutor do
         new_to_be_executed,
         Map.merge(new_executed, newly_executed),
         still_pending,
-        max_retries,
-        deadline
+        max_retries
       )
     else
       # No pending functions, continue with updated state
@@ -493,8 +420,7 @@ defmodule Handoff.DistributedExecutor do
         new_to_be_executed,
         new_executed,
         new_pending,
-        max_retries,
-        deadline
+        max_retries
       )
     end
   end
@@ -939,12 +865,6 @@ defmodule Handoff.DistributedExecutor do
       {[id | sorted], visited}
     end
   end
-
-  # Per-call timeout for the executor's best-effort ResultStore clear
-  # (store_safe/3 budgets its own call). Overridable via
-  # `config :handoff, result_store_timeout: <ms>` — tests use a short value to
-  # fail fast against a suspended store.
-  defp result_store_timeout, do: Application.get_env(:handoff, :result_store_timeout, 5_000)
 
   # Persists a function result (and registers its data location) without ever
   # exiting the caller. `GenServer.call` exits the caller on timeout, which

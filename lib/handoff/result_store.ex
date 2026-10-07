@@ -206,6 +206,20 @@ defmodule Handoff.ResultStore do
     GenServer.call(__MODULE__, {:clear, dag_id})
   end
 
+  @doc """
+  Like `clear/1`, but never exits the caller. One call bounded by
+  `:result_store_timeout` (default 5000ms); returns `{:error, :store_timeout}`
+  or `{:error, :store_unavailable}` instead of exiting. A timed-out clear is
+  still in the store's mailbox and runs once the store catches up, so there
+  is nothing to retry.
+  """
+  def clear_safe(dag_id) do
+    GenServer.call(__MODULE__, {:clear, dag_id}, store_timeout())
+  catch
+    :exit, {:timeout, {GenServer, :call, _}} -> {:error, :store_timeout}
+    :exit, _reason -> {:error, :store_unavailable}
+  end
+
   # Server callbacks
 
   @impl true

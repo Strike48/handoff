@@ -109,6 +109,18 @@ defmodule Handoff.ResultStoreSlowStoreTest do
       assert Process.alive?(self())
     end
 
+    test "clear_safe returns an error instead of exiting, and the clear still lands" do
+      :ok = ResultStore.store(@dag_id, :fn, "value")
+      suspend_store!()
+
+      assert {:error, :store_timeout} = ResultStore.clear_safe(@dag_id)
+
+      resume_store!()
+      # Any call is answered only after the queued clear has run.
+      _ = :sys.get_state(ResultStore)
+      assert {:error, :not_found} = ResultStore.get(@dag_id, :fn)
+    end
+
     test "a timed-out write queues the value once, not once per attempt" do
       suspend_store!()
 

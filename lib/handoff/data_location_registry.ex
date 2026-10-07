@@ -115,6 +115,21 @@ defmodule Handoff.DataLocationRegistry do
     GenServer.call(__MODULE__, {:clear_dag, dag_id})
   end
 
+  @doc """
+  Like `clear/1`, but never exits the caller: one call bounded by
+  `:result_store_timeout`, `{:error, :registry_unavailable}` on timeout or a
+  dead registry. A timed-out clear still runs once the registry catches up.
+  """
+  def clear_safe(dag_id) do
+    GenServer.call(
+      __MODULE__,
+      {:clear_dag, dag_id},
+      Application.get_env(:handoff, :result_store_timeout, 5_000)
+    )
+  catch
+    :exit, _reason -> {:error, :registry_unavailable}
+  end
+
   # Server callbacks
 
   @impl true
