@@ -196,6 +196,32 @@ defmodule Handoff.ResultStoreSlowStoreTest do
       assert Process.whereis(DistributedExecutor) == executor
     end
 
+    test "a remote function whose location cannot be registered fails, not its consumer" do
+      [node_2 | _] = Application.get_env(:handoff, :test_nodes)
+      :rpc.call(node_2, SimpleResourceTracker, :register, [node_2, %{cpu: 4, memory: 2000}])
+      SimpleResourceTracker.register(node_2, %{cpu: 4, memory: 2000})
+
+      dag =
+        make_ref()
+        |> DAG.new()
+        |> DAG.add_function(%Function{
+          id: :remote_fn,
+          args: [],
+          code: &Elixir.Function.identity/1,
+          extra_args: [42],
+          node: node_2,
+          cost: %{cpu: 1, memory: 100}
+        })
+
+      on_exit(fn -> :sys.resume(Handoff.DataLocationRegistry) end)
+      :ok = :sys.suspend(Handoff.DataLocationRegistry)
+
+      assert {:ok, %{results: results}} = DistributedExecutor.execute(dag)
+      # The executor retries a failed function, then reports the last error.
+      assert {:error, message} = results[:remote_fn]
+      assert message =~ ":registry_unavailable"
+    end
+
     test "store_distributed returns an error and registers nothing when the store is slow" do
       suspend_store!()
 
@@ -293,8 +319,10 @@ defmodule Handoff.ResultStoreSlowStoreTest do
 
       start = System.monotonic_time(:millisecond)
 
+      # Call the :get handler itself: ResultStore.get/2 reads ETS directly
+      # and would not notice work put back into the handler.
       for _ <- 1..5 do
-        {:ok, ^payload} = ResultStore.get(@large_dag_id, 50_000)
+        {:ok, ^payload} = GenServer.call(ResultStore, {:get, @large_dag_id, 50_000})
       end
 
       elapsed = System.monotonic_time(:millisecond) - start

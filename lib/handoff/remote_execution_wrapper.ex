@@ -41,7 +41,8 @@ defmodule Handoff.RemoteExecutionWrapper do
       # 3. Store result in this node's local ResultStore.
       # store_safe/3: a raw store/3 timeout would exit this worker task
       # (GenServer.call exits the caller on timeout) before the case below
-      # could react; store_safe retries and returns an error tuple instead
+      # could react; store_safe makes one bounded call and returns an error
+      # tuple instead
       # (Strike48/matrix#3475).
       case ResultStore.store_safe(dag_id, function_struct.id, actual_result) do
         :ok ->

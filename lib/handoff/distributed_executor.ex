@@ -846,8 +846,13 @@ defmodule Handoff.DistributedExecutor do
            all_dag_functions
          ]) do
       {:ok, :result_stored_locally} ->
-        DataLocationRegistry.register_safe(dag_id, function.id, function.node)
-        {:ok, {:remote_store_and_registry_ok, function.id, function.node}}
+        # Without a registered location no consumer can find the remote
+        # result, so a failed registration fails this function here instead
+        # of a downstream one later.
+        case DataLocationRegistry.register_safe(dag_id, function.id, function.node) do
+          :ok -> {:ok, {:remote_store_and_registry_ok, function.id, function.node}}
+          {:error, reason} -> {:error, reason}
+        end
 
       {:error, reason} ->
         {:error, reason}
@@ -917,8 +922,8 @@ defmodule Handoff.DistributedExecutor do
     end
   end
 
-  # Per-call timeout for ResultStore GenServer calls issued by the executor
-  # (best-effort clears and store_safe retries). Overridable via
+  # Per-call timeout for the executor's best-effort ResultStore clear
+  # (store_safe/3 budgets its own call). Overridable via
   # `config :handoff, result_store_timeout: <ms>` — tests use a short value to
   # fail fast against a suspended store.
   defp result_store_timeout, do: Application.get_env(:handoff, :result_store_timeout, 5_000)
