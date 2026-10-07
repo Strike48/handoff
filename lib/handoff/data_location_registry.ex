@@ -37,7 +37,12 @@ defmodule Handoff.DataLocationRegistry do
   - node_id: The node where the data is stored
   """
   def register(dag_id, data_id, node_id) do
-    GenServer.call(__MODULE__, {:register, dag_id, data_id, node_id})
+    # Same bounded call timeout as the ResultStore (:result_store_timeout).
+    GenServer.call(
+      __MODULE__,
+      {:register, dag_id, data_id, node_id},
+      Application.get_env(:handoff, :result_store_timeout, 5_000)
+    )
   end
 
   @doc """

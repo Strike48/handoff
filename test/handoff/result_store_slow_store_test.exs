@@ -129,6 +129,76 @@ defmodule Handoff.ResultStoreSlowStoreTest do
     end
   end
 
+  describe "dead store, stalled registry, cross-node cache write" do
+    test "store_safe returns an error instead of exiting when the store is not running" do
+      # The application starts Handoff.Supervisor without a registered name;
+      # find it as the store's parent.
+      {:dictionary, dict} = Process.info(Process.whereis(ResultStore), :dictionary)
+      [supervisor | _] = Keyword.fetch!(dict, :"$ancestors")
+
+      on_exit(fn -> Supervisor.restart_child(supervisor, ResultStore) end)
+      :ok = Supervisor.terminate_child(supervisor, ResultStore)
+
+      # GenServer.call to a dead name exits with {:noproc, {GenServer, :call, _}}.
+      assert {:error, :store_unavailable} = ResultStore.store_safe(@dag_id, :fn, "value")
+      assert Process.alive?(self())
+    end
+
+    test "a stalled location registry does not crash the execution or the executor" do
+      on_exit(fn -> :sys.resume(Handoff.DataLocationRegistry) end)
+      executor = Process.whereis(DistributedExecutor)
+      :ok = :sys.suspend(Handoff.DataLocationRegistry)
+
+      # The result is stored; only its location hint is lost.
+      assert {:ok, %{results: %{fn1: "stored-value"}}} =
+               DistributedExecutor.execute(single_fn_dag(:fn1))
+
+      assert Process.whereis(DistributedExecutor) == executor
+    end
+
+    test "store_distributed returns an error and registers nothing when the store is slow" do
+      suspend_store!()
+
+      assert {:error, :store_timeout} =
+               Handoff.DistributedResultStore.store_distributed(@dag_id, :fn, "value")
+
+      assert {:error, :not_found} = Handoff.DataLocationRegistry.lookup(@dag_id, :fn)
+    end
+
+    test "a slow local store while caching a value fetched from another node does not crash the execution" do
+      [node_2 | _] = Application.get_env(:handoff, :test_nodes)
+      :rpc.call(node_2, SimpleResourceTracker, :register, [node_2, %{cpu: 4, memory: 2000}])
+      SimpleResourceTracker.register(node_2, %{cpu: 4, memory: 2000})
+
+      dag =
+        make_ref()
+        |> DAG.new()
+        |> DAG.add_function(%Function{
+          id: :source,
+          args: [],
+          code: &Elixir.Function.identity/1,
+          extra_args: [42],
+          node: node_2,
+          cost: %{cpu: 1, memory: 100}
+        })
+        |> DAG.add_function(%Function{
+          id: :consumer,
+          args: [:source],
+          code: &DistributedTestFunctions.f/1,
+          node: Node.self(),
+          cost: %{cpu: 1, memory: 100}
+        })
+
+      suspend_store!()
+
+      # The local cache write of :source fails, the value is still used, and
+      # only :consumer's own (failed) store is attributed to it.
+      assert {:ok, %{results: results}} = DistributedExecutor.execute(dag)
+      assert results[:source] == :remote_executed_and_registered
+      assert {:error, {:result_store_unavailable, :store_timeout}} = results[:consumer]
+    end
+  end
+
   describe "DAG execution against a slow store" do
     test "a suspended store does not crash the execution with :execution_crashed" do
       suspend_store!()

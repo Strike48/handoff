@@ -181,8 +181,9 @@ defmodule Handoff.RemoteExecutionWrapper do
       # Get from remote node
       case :rpc.call(source_node, ResultStore, :get, [dag_id, arg_id]) do
         {:ok, value} ->
-          # Cache locally for future use
-          ResultStore.store(dag_id, arg_id, value)
+          # Cache locally for future use. Best effort: the value is already in
+          # hand, so a slow store must not exit this remote execution.
+          _ = ResultStore.store_safe(dag_id, arg_id, value)
           value
 
         {:error, reason} ->

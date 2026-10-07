@@ -148,7 +148,7 @@ defmodule Handoff.DistributedExecutor do
       arg_id ->
         # Only register if it's a literal value, not a function ID
         if not Map.has_key?(dag.functions, arg_id) do
-          DataLocationRegistry.register(dag.id, arg_id, Node.self())
+          register_location(dag.id, arg_id, Node.self())
         end
     end)
 
@@ -845,7 +845,7 @@ defmodule Handoff.DistributedExecutor do
            all_dag_functions
          ]) do
       {:ok, :result_stored_locally} ->
-        DataLocationRegistry.register(dag_id, function.id, function.node)
+        register_location(dag_id, function.id, function.node)
         {:ok, {:remote_store_and_registry_ok, function.id, function.node}}
 
       {:error, reason} ->
@@ -932,7 +932,7 @@ defmodule Handoff.DistributedExecutor do
   defp store_result(dag, function_id, node, result) do
     case ResultStore.store_safe(dag.id, function_id, result) do
       :ok ->
-        DataLocationRegistry.register(dag.id, function_id, node)
+        register_location(dag.id, function_id, node)
         :stored
 
       {:error, reason} ->
@@ -943,6 +943,23 @@ defmodule Handoff.DistributedExecutor do
 
         {:not_stored, reason}
     end
+  end
+
+  # Registers a data location without ever exiting the caller. Two callers run
+  # in places that must not exit: the singleton's handle_call({:execute, ...})
+  # (an exit there takes down every in-flight DAG on the node) and the
+  # execution task (an exit there crashes the run). A failed registration
+  # only loses the location hint; local reads go to the ResultStore first.
+  defp register_location(dag_id, data_id, node) do
+    DataLocationRegistry.register(dag_id, data_id, node)
+  catch
+    :exit, reason ->
+      Logger.error(
+        "Could not register location of #{inspect(data_id)} for DAG #{inspect(dag_id)}: " <>
+          inspect(reason)
+      )
+
+      {:error, :registry_unavailable}
   end
 
   # New helper function to fetch arguments from appropriate nodes
@@ -976,7 +993,9 @@ defmodule Handoff.DistributedExecutor do
         # Find where the result is stored
         with {:ok, source_node} <- DataLocationRegistry.lookup(dag_id, arg_id),
              {:ok, actual_value} <- :rpc.call(source_node, ResultStore, :get, [dag_id, arg_id]) do
-          ResultStore.store(dag_id, arg_id, actual_value)
+          # Local cache of a value we already hold: a failed write only costs
+          # a re-fetch later, so it must not exit the execution task.
+          _ = ResultStore.store_safe(dag_id, arg_id, actual_value)
           actual_value
         else
           {:error, :not_found} ->

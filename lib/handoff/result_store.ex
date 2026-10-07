@@ -262,7 +262,9 @@ defmodule Handoff.ResultStore do
         {:error, :store_timeout}
       end
 
-    :exit, :noproc ->
+    # A call to a name with no process exits with
+    # `{:noproc, {GenServer, :call, [...]}}`, not a bare `:noproc`.
+    :exit, {:noproc, _} ->
       Logger.error(
         "Handoff.ResultStore process is not running; " <>
           "result for dag_id=#{inspect(dag_id)} id=#{inspect(id)} was NOT stored"
